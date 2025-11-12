@@ -8,7 +8,7 @@ const cors = require('cors');
 
 // --- Configuration ---
 const app = express();
-const port = 3001;
+const port = process.env.PORT || 3001;
 
 // Initialize GoogleGenAI client using the key from .env
 const ai = new GoogleGenAI({
