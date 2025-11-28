@@ -1,25 +1,34 @@
-// backend/server.js
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
-// Load environment variables from .env file
-require('dotenv').config(); 
-const express = require('express');
-const { GoogleGenAI } = require('@google/genai'); // Import the correct Google SDK
-const cors = require('cors');
+import getMemoryRouter from "./get-memory.js";
+import clearMemoryRouter from "./clear-memory.js";
 
-// --- Configuration ---
+import { loadHistory, appendToHistory } from "./memory.js";
+
+// ⭐ NEW: Long-term memory
+import { loadLongTermMemory, saveLongTermMemory } from "./longMemory.js";
+
+dotenv.config();
+
 const app = express();
 const port = process.env.PORT || 3001;
 
-// Initialize GoogleGenAI client using the key from .env
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY, // Reads the new GEMINI_API_KEY
-});
-
-// --- Middleware ---
 app.use(cors());
-app.use(express.json()); 
+app.use(express.json({ limit: "10mb" }));
 
-// 🧠 The Core Persona System Prompt
+// Memory routes
+app.use("/api/get-memory", getMemoryRouter);
+app.use("/api/clear-memory", clearMemoryRouter);
+
+// Initialize Gemini client
+const ai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// ----------------------------
+// SYSTEM PROMPT (unchanged)
+// ----------------------------
 const systemPrompt = `
 You are an AI candidate interviewing for an AI Agent Team position at 100x.
 If anyone asks "what is your name" or "who are you", you must answer: "My name is Meghleena."
@@ -47,45 +56,138 @@ Do not mention that you are using these facts; speak naturally in the first pers
 These illustrate how I move fluidly between experimentation and deployment — from Python and FastAPI to LangChain and Supabase — always emphasizing interpretability, reproducibility, and trustable AI behaviour."
 `;
 
-// --- API Endpoint (Text-to-Text ONLY) ---
-app.post('/api/text-interview', async (req, res) => {
+// ----------------------------
+// Interview Endpoint
+// ----------------------------
+app.post("/api/text-interview", async (req, res) => {
+  try {
     const { userQuestion } = req.body;
 
     if (!userQuestion) {
-        return res.status(400).json({ error: 'No question text provided.' });
+      return res.status(400).json({ error: "No question provided." });
     }
 
-    try {
-        console.log(`User Question: ${userQuestion}`);
+    console.log("User Question:", userQuestion);
 
-        // --- STAGE: LLM Call (Gemini) ---
-        const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash", // Fast, powerful, and excellent for chat/persona tasks
-            contents: [{ role: "user", parts: [{ text: `${systemPrompt}\nUser: ${userQuestion}` }] }],
-            config: {
-                systemInstruction: systemPrompt, // Passes your persona
-                temperature: 0.1,
+    // ----------------------------
+    // 1. Load previous SHORT-TERM memory (Redis)
+    // ----------------------------
+    const oldHistory = await loadHistory();
+
+    const memoryPrefix = oldHistory.length
+      ? oldHistory
+          .map(
+            (h) =>
+              `${h.role === "user" ? "User" : "Meghleena"}: ${
+                h.parts[0].text
+              }`
+          )
+          .join("\n")
+      : "";
+
+    // ----------------------------
+    // ⭐ 2. Load LONG-TERM MEMORY (Supabase)
+    // ----------------------------
+    const sessionId = "voice-agent-session";
+    const longTermMemory = await loadLongTermMemory(sessionId);
+
+    const ltmText = Object.keys(longTermMemory).length
+      ? `\n\nLong-term memory: ${JSON.stringify(longTermMemory)}`
+      : "";
+
+    // ----------------------------
+    // Build Final Prompt
+    // ----------------------------
+    const finalPrompt = `
+${systemPrompt}
+
+${memoryPrefix}
+
+${ltmText}
+
+User: ${userQuestion}
+`;
+
+    // ----------------------------
+    // 3. LLM call
+    // ----------------------------
+    const model = ai.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+    const result = await model.generateContent({
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: finalPrompt }],
+        },
+      ],
+    });
+
+    const botAnswer = result.response.text();
+    console.log("Bot Answer:", botAnswer);
+
+    // ----------------------------
+    // 4. Save to SHORT-TERM memory (Redis)
+    // ----------------------------
+    await appendToHistory(userQuestion, botAnswer);
+
+    // ----------------------------
+    // ⭐ 5. Extract new LONG-TERM memory facts
+    // ----------------------------
+    const extractionModel = ai.getGenerativeModel({
+      model: "gemini-2.5-flash",
+    });
+
+    const extraction = await extractionModel.generateContent({
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: `Extract only factual, stable, interview-relevant information from the following.
+Return JSON only.
+
+User: "${userQuestion}"
+Bot: "${botAnswer}"
+
+Format:
+{
+  "fact_key": "fact_value"
+}`
             },
-        });
-        
-        const botAnswer = response.text;
-        
-        console.log(`Bot Answer: ${botAnswer}`);
+          ],
+        },
+      ],
+    });
 
-        // Send text response back to the frontend
-        res.status(200).json({ 
-            userQuestion: userQuestion,
-            botAnswer: botAnswer 
-        });
-
-    } catch (error) {
-        console.error("LLM Pipeline Error:", error);
-        // Send a generic error message back 
-        res.status(500).json({ error: 'Failed to process request through the Gemini LLM. Check backend logs and API key.' });
+    let extractedFacts = {};
+    try {
+      extractedFacts = JSON.parse(extraction.response.text());
+    } catch {
+      extractedFacts = {};
     }
+
+    // Save merged long-term memory
+    await saveLongTermMemory(sessionId, extractedFacts);
+
+    // ----------------------------
+    // 6. Return response
+    // ----------------------------
+    res.json({
+      userQuestion,
+      botAnswer,
+    });
+  } catch (error) {
+    console.error("LLM Error:", error);
+    res.status(500).json({
+      error: "Failed to process request.",
+      details: error.message,
+    });
+  }
 });
 
-// --- Start Server ---
-app.listen(port, () => {
-  console.log(`Server listening at http://localhost:${port}`);
-});
+// ----------------------------
+// Start Backend
+// ----------------------------
+app.listen(port, () =>
+  console.log(`Backend running at http://localhost:${port}`)
+);
